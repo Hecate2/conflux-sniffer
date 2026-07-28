@@ -47,6 +47,9 @@ impl Decodable for Transactions {
 
 impl Handleable for Transactions {
     fn handle(self, ctx: &Context) -> Result<(), Error> {
+        if ctx.manager.protocol_config.sniffer_mode {
+            return Ok(());
+        }
         let transactions = self.transactions;
         debug!(
             "Received {:?} transactions from Peer {:?}",
@@ -126,6 +129,9 @@ pub struct TransactionDigests {
 
 impl Handleable for TransactionDigests {
     fn handle(self, ctx: &Context) -> Result<(), Error> {
+        if ctx.manager.protocol_config.sniffer_mode {
+            return Ok(());
+        }
         {
             let peer_info = ctx.manager.syn.get_peer_info(&ctx.node_id)?;
 

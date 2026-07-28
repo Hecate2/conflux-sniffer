@@ -1933,6 +1933,13 @@ impl<'a> NetworkContextTrait for NetworkContext<'a> {
         self.network_service.get_peer_connection_origin(node_id)
     }
 
+    fn get_peer_addr(&self, node_id: &NodeId) -> Option<std::net::SocketAddr> {
+        self.network_service
+            .sessions
+            .get_by_id(node_id)
+            .map(|s| s.read().address())
+    }
+
     fn is_peer_self(&self, node_id: &NodeId) -> bool {
         *node_id == *self.network_service.metadata.id()
     }

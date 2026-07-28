@@ -277,6 +277,9 @@ pub trait NetworkContext {
 
     fn get_peer_connection_origin(&self, node_id: &NodeId) -> Option<bool>;
 
+    /// Get the remote socket address of a connected peer.
+    fn get_peer_addr(&self, node_id: &NodeId) -> Option<std::net::SocketAddr>;
+
     fn send(
         &self, node_id: &NodeId, msg: Vec<u8>,
         min_protocol_version: ProtocolVersion,

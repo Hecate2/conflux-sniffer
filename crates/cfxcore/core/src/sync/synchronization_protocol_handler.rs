@@ -45,6 +45,7 @@ use rlp::Rlp;
 use std::{
     cmp::{self, min},
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    io::Write,
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -383,6 +384,20 @@ pub struct SynchronizationProtocolHandler {
 
     // provider for serving light protocol queries
     light_provider: Arc<LightProvider>,
+
+    // Sniffer mode fields
+    #[ignore_malloc_size_of = "sniffer fields not measured"]
+    pub block_first_seen: Arc<RwLock<HashMap<H256, BlockFirstSeen>>>,
+    #[ignore_malloc_size_of = "channel not measured"]
+    pub sniffer_writer_tx: Option<std::sync::mpsc::Sender<BlockFirstSeen>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BlockFirstSeen {
+    pub block_hash: H256,
+    pub first_peer_ip: Option<std::net::IpAddr>,
+    pub first_seen_at: SystemTime,
+    pub first_peer_node_id: NodeId,
 }
 
 #[derive(Clone, Default, DeriveMallocSizeOf)]
@@ -427,6 +442,7 @@ pub struct ProtocolConfiguration {
     pub check_status_genesis: bool,
 
     pub pos_started_as_voter: bool,
+    pub sniffer_mode: bool,
 }
 
 impl SynchronizationProtocolHandler {
@@ -455,6 +471,7 @@ impl SynchronizationProtocolHandler {
 
         let state_sync = Arc::new(SnapshotChunkSync::new(state_sync_config));
 
+        let sniffer_mode = protocol_config.sniffer_mode;
         Self {
             protocol_version: SYNCHRONIZATION_PROTOCOL_VERSION,
             protocol_config,
@@ -478,6 +495,65 @@ impl SynchronizationProtocolHandler {
             state_sync,
             synced_epoch_id: Default::default(),
             light_provider,
+            block_first_seen: Arc::new(RwLock::new(HashMap::new())),
+            sniffer_writer_tx: if sniffer_mode {
+                Some(Self::start_sniffer_writer("sniffer_records.jsonl"))
+            } else {
+                None
+            },
+        }
+    }
+
+    fn start_sniffer_writer(
+        log_path: &str,
+    ) -> std::sync::mpsc::Sender<BlockFirstSeen> {
+        let (tx, rx) = std::sync::mpsc::channel::<BlockFirstSeen>();
+        let path = log_path.to_string();
+        std::thread::spawn(move || {
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .expect("Failed to open sniffer log file");
+            for record in rx {
+                let json = serde_json::json!({
+                    "block_hash": format!("{:?}", record.block_hash),
+                    "first_peer_ip": record.first_peer_ip.map(|ip| ip.to_string()),
+                    "first_peer_node_id": format!("{}", record.first_peer_node_id),
+                    "first_seen_at": record.first_seen_at
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs(),
+                });
+                let _ = writeln!(file, "{}", json.to_string());
+            }
+        });
+        tx
+    }
+
+    pub fn record_block_hash_first_seen(
+        &self, hash: H256, peer_addr: Option<std::net::SocketAddr>,
+        node_id: NodeId,
+    ) {
+        let mut map = self.block_first_seen.write();
+        if !map.contains_key(&hash) {
+            let entry = BlockFirstSeen {
+                block_hash: hash,
+                first_peer_ip: peer_addr.map(|a| a.ip()),
+                first_seen_at: SystemTime::now(),
+                first_peer_node_id: node_id,
+            };
+            map.insert(hash, entry.clone());
+            drop(map);
+
+            info!(
+                "[SNIFFER] NEW_BLOCK_HASH first seen: hash={:?}, ip={:?}, node_id={}",
+                hash, peer_addr.map(|a| a.ip()), node_id
+            );
+
+            if let Some(tx) = &self.sniffer_writer_tx {
+                let _ = tx.send(entry);
+            }
         }
     }
 
@@ -502,6 +578,9 @@ impl SynchronizationProtocolHandler {
     }
 
     pub fn catch_up_mode(&self) -> bool {
+        if self.protocol_config.sniffer_mode {
+            return false;
+        }
         self.phase_manager.get_current_phase().phase_type()
             != SyncPhaseType::Normal
     }
@@ -578,6 +657,7 @@ impl SynchronizationProtocolHandler {
             node_id: *peer,
             io,
             manager: self,
+            peer_addr: io.get_peer_addr(peer),
         };
 
         if !handle_rlp_message(msg_id, &ctx, &rlp)? {
@@ -725,6 +805,9 @@ impl SynchronizationProtocolHandler {
     }
 
     pub fn start_sync(&self, io: &dyn NetworkContext) {
+        if self.protocol_config.sniffer_mode {
+            return;
+        }
         let current_phase_type =
             self.phase_manager.get_current_phase().phase_type();
         if current_phase_type == SyncPhaseType::CatchUpRecoverBlockHeaderFromDB
@@ -1023,6 +1106,7 @@ impl SynchronizationProtocolHandler {
                 node_id: io.self_node_id(),
                 io,
                 manager: self,
+                peer_addr: None,
             };
 
             ctx.send_response(&block_headers_resp)
@@ -1282,7 +1366,6 @@ impl SynchronizationProtocolHandler {
     }
 
     fn broadcast_heartbeat(&self, io: &dyn NetworkContext) {
-        let status_message = self.produce_status_message_v2();
         let heartbeat_message = self.produce_heartbeat_message();
         debug!("Broadcasting heartbeat message: {:?}", heartbeat_message);
 
@@ -1292,11 +1375,16 @@ impl SynchronizationProtocolHandler {
         {
             warn!("Error broadcasting heartbeat message");
         }
-        if self
-            .broadcast_message(io, &Default::default(), &status_message)
-            .is_err()
-        {
-            warn!("Error broadcasting status message");
+        // In sniffer mode, skip broadcasting StatusV2 to reduce unnecessary
+        // traffic. Status handshake is still sent per-peer in on_peer_connected.
+        if !self.protocol_config.sniffer_mode {
+            let status_message = self.produce_status_message_v2();
+            if self
+                .broadcast_message(io, &Default::default(), &status_message)
+                .is_err()
+            {
+                warn!("Error broadcasting status message");
+            }
         }
     }
 
@@ -1609,6 +1697,9 @@ impl SynchronizationProtocolHandler {
     }
 
     pub fn update_sync_phase(&self, io: &dyn NetworkContext) {
+        if self.protocol_config.sniffer_mode {
+            return;
+        }
         match self.phase_manager_lock.try_lock() {
             Some(_pm_lock) => {
                 self.phase_manager.try_initialize(io, self);
@@ -1858,6 +1949,9 @@ impl NetworkProtocolHandler for SynchronizationProtocolHandler {
     fn on_work_dispatch(
         &self, io: &dyn NetworkContext, work_type: HandlerWorkType,
     ) {
+        if self.protocol_config.sniffer_mode {
+            return;
+        }
         if work_type == SyncHandlerWorkType::RecoverPublic as HandlerWorkType {
             if let Err(e) = self.on_blocks_inner_task(io) {
                 warn!("Error processing RecoverPublic task: {:?}", e);
@@ -1905,15 +1999,20 @@ impl NetworkProtocolHandler for SynchronizationProtocolHandler {
 
     fn on_timeout(&self, io: &dyn NetworkContext, timer: TimerToken) {
         trace!("Timeout: timer={:?}", timer);
+        let sniffer = self.protocol_config.sniffer_mode;
         match timer {
             TX_TIMER => {
-                self.propagate_new_transactions(io);
+                if !sniffer {
+                    self.propagate_new_transactions(io);
+                }
             }
             CHECK_FUTURE_BLOCK_TIMER => {
-                self.check_future_blocks(io);
-                self.graph.check_not_ready_frontier(
-                    self.insert_header_to_consensus(),
-                );
+                if !sniffer {
+                    self.check_future_blocks(io);
+                    self.graph.check_not_ready_frontier(
+                        self.insert_header_to_consensus(),
+                    );
+                }
             }
             CHECK_REQUEST_TIMER => {
                 self.remove_expired_flying_request(io);
@@ -1922,16 +2021,22 @@ impl NetworkProtocolHandler for SynchronizationProtocolHandler {
                 self.send_heartbeat(io);
             }
             BLOCK_CACHE_GC_TIMER => {
-                self.gc();
+                if !sniffer {
+                    self.gc();
+                }
             }
             CHECK_CATCH_UP_MODE_TIMER => {
-                self.update_sync_phase(io);
+                if !sniffer {
+                    self.update_sync_phase(io);
+                }
             }
             LOG_STATISTIC_TIMER => {
                 self.log_statistics();
             }
             TOTAL_WEIGHT_IN_PAST_TIMER => {
-                self.update_total_weight_delta_heartbeat();
+                if !sniffer {
+                    self.update_total_weight_delta_heartbeat();
+                }
             }
             CHECK_PEER_HEARTBEAT_TIMER => {
                 let timeout_peers = self.syn.get_heartbeat_timeout_peers(
@@ -1946,15 +2051,17 @@ impl NetworkProtocolHandler for SynchronizationProtocolHandler {
                 }
             }
             EXPIRE_BLOCK_GC_TIMER => {
-                // remove expire blocks every `expire_block_gc_period`
-                // TODO Parameterize this timeout.
-                // Set to twice expire period to ensure that stale blocks will
-                // exist in the frontier across two consecutive GC.
-                self.expire_block_gc(
-                    io,
-                    self.protocol_config.sync_expire_block_timeout.as_secs(),
-                )
-                .ok();
+                if !sniffer {
+                    // remove expire blocks every `expire_block_gc_period`
+                    // TODO Parameterize this timeout.
+                    // Set to twice expire period to ensure that stale blocks will
+                    // exist in the frontier across two consecutive GC.
+                    self.expire_block_gc(
+                        io,
+                        self.protocol_config.sync_expire_block_timeout.as_secs(),
+                    )
+                    .ok();
+                }
             }
             _ => warn!("Unknown timer {} triggered.", timer),
         }

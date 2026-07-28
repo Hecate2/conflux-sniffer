@@ -408,6 +408,10 @@ build_config! {
         (dev_pos_private_key_encryption_password, (Option<String>), None)
         (pos_started_as_voter, (bool), true)
 
+        // Sniffer mode
+        (sniffer_mode, (bool), false)
+        (sniffer_log_file, (String), "sniffer_records.jsonl".to_string())
+
         // Light node section
         (ln_epoch_request_batch_size, (Option<usize>), None)
         (ln_epoch_request_timeout_sec, (Option<u64>), None)
@@ -972,6 +976,7 @@ impl Configuration {
                 .expect("set to genesis if none"),
             check_status_genesis: self.raw_conf.check_status_genesis,
             pos_started_as_voter: self.raw_conf.pos_started_as_voter,
+            sniffer_mode: self.raw_conf.sniffer_mode,
         }
     }
 

@@ -30,6 +30,17 @@ impl Handleable for NewBlock {
     // TODO This is only used in tests now. Maybe we can add a rpc to send full
     // block and remove NEW_BLOCK from p2p
     fn handle(self, ctx: &Context) -> Result<(), Error> {
+        // Sniffer mode: record IP and block header, then return
+        if ctx.manager.protocol_config.sniffer_mode {
+            let hash = self.block.block_header.hash();
+            ctx.manager.record_block_hash_first_seen(
+                hash,
+                ctx.peer_addr,
+                ctx.node_id,
+            );
+            return Ok(());
+        }
+
         // We may receive some messages from peer during recover from db
         // phase. We should ignore it, since it may cause some
         // inconsistency.

@@ -384,6 +384,7 @@ impl SnapshotChunkSync {
                 node_id: Default::default(),
                 io,
                 manager: sync_handler,
+                peer_addr: None,
             },
         );
 

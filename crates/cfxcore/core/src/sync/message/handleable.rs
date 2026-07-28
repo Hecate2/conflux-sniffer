@@ -9,11 +9,13 @@ use crate::{
     },
 };
 use network::{node_table::NodeId, NetworkContext};
+use std::net::SocketAddr;
 
 pub struct Context<'a> {
     pub io: &'a dyn NetworkContext,
     pub node_id: NodeId,
     pub manager: &'a SynchronizationProtocolHandler,
+    pub peer_addr: Option<SocketAddr>,
 }
 
 impl<'a> Context<'a> {

@@ -31,6 +31,18 @@ impl Handleable for NewBlockHashes {
     fn handle(self, ctx: &Context) -> Result<(), Error> {
         debug!("on_new_block_hashes, msg={:?}", self);
 
+        // Sniffer mode: record first-seen IP unconditionally
+        if ctx.manager.protocol_config.sniffer_mode {
+            for hash in &self.block_hashes {
+                ctx.manager.record_block_hash_first_seen(
+                    *hash,
+                    ctx.peer_addr,
+                    ctx.node_id,
+                );
+            }
+            return Ok(());
+        }
+
         if ctx.manager.catch_up_mode() {
             // If a node is in catch-up mode and we are not in test-mode, we
             // just simple ignore new block hashes.

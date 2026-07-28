@@ -27,3 +27,9 @@ venv
 testdata/evm-spec-test/
 testdata/config.toml
 testdata/evm-spec-test.tar
+
+# Sniffer mode runtime artifacts
+**/pos_key
+**/sniffer_data/
+**/sniffer_records.jsonl
+pos_config/
