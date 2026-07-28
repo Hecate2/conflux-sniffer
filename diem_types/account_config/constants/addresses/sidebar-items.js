@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["diem_root_address","validator_set_address"]};

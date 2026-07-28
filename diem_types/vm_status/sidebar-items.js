@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["KeptVMStatus","StatusCode","StatusType","VMStatus"],"type":["DiscardedVMStatus"]};

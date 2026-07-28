@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["ON_CHAIN_CONFIG_REGISTRY"],"fn":["config_address","new_epoch_event_key"],"struct":["ConfigID","OnChainConfigPayload","ValidatorSet"],"trait":["OnChainConfig"]};

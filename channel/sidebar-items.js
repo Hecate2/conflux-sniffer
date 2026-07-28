@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"mod":["diem_channel","message_queues"]};
