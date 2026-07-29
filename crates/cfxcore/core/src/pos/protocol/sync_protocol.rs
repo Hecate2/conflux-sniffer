@@ -497,6 +497,43 @@ impl NetworkProtocolHandler for HotStuffSynchronizationProtocol {
         let msg_id = raw[len - 1];
         debug!("on_message: peer={:?}, msgid={:?}", peer, msg_id);
 
+        // Log PoS consensus messages for sniffer analysis.
+        // PROPOSAL (0x50) and CONSENSUS_MSG (0x57): info level — high value, low frequency.
+        // VOTE (0x51) and SYNC_INFO (0x52): debug level — very high frequency, would
+        // cause excessive I/O at info level. The peer-connected log already captures
+        // the AccountAddress→NodeId→IP mapping, so vote-level logging is supplementary.
+        if msg_id == 0x50 /* PROPOSAL */
+            || msg_id == 0x51 /* VOTE */
+            || msg_id == 0x52 /* SYNC_INFO */
+            || msg_id == 0x57 /* CONSENSUS_MSG */
+        {
+            let peer_ip = io
+                .get_peer_addr(peer)
+                .map(|a| a.to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+
+            // Look up AccountAddress from peer state to bridge PoS↔P2P identity
+            let peer_hash = keccak(peer);
+            let account_addr = self
+                .peers
+                .get(&peer_hash)
+                .as_ref()
+                .and_then(|s| s.read().pos_public_key.clone())
+                .map(|pk| from_consensus_public_key(&pk.0, &pk.1));
+
+            if msg_id == 0x50 || msg_id == 0x57 {
+                info!(
+                    "[POSSNIFFER] Consensus msg: node_id={:#x}, ip={}, msg_id=0x{:02x}, account_addr={:?}",
+                    peer, peer_ip, msg_id, account_addr
+                );
+            } else {
+                debug!(
+                    "[POSSNIFFER] Consensus msg: node_id={:#x}, ip={}, msg_id=0x{:02x}, account_addr={:?}",
+                    peer, peer_ip, msg_id, account_addr
+                );
+            }
+        }
+
         let msg = &raw[0..raw.len() - 1];
         self.dispatch_message(io, peer, msg_id.into(), msg)
             .unwrap_or_else(|e| self.handle_error(io, peer, msg_id.into(), e));
@@ -555,6 +592,16 @@ impl NetworkProtocolHandler for HotStuffSynchronizationProtocol {
                 state.id = *node_id;
                 state.peer_hash = peer_hash;
                 self.request_manager.on_peer_connected(node_id);
+
+                // Log PoS peer connection with NodeId and IP for sniffer analysis
+                let peer_ip = io
+                    .get_peer_addr(node_id)
+                    .map(|a| a.to_string())
+                    .unwrap_or_else(|| "unknown".to_string());
+                info!(
+                    "[POSSNIFFER] PoS peer connected: node_id={:#x}, ip={}",
+                    node_id, peer_ip
+                );
             } else {
                 warn!(
                     "PeerState is missing for peer: peer_hash={:?}",
@@ -570,10 +617,26 @@ impl NetworkProtocolHandler for HotStuffSynchronizationProtocol {
         }
 
         if let Some(public_key) = pos_public_key {
-            self.pos_peer_mapping.write().insert(
-                from_consensus_public_key(&public_key.0, &public_key.1),
-                peer_hash,
-            );
+            let account_addr =
+                from_consensus_public_key(&public_key.0, &public_key.1);
+            self.pos_peer_mapping
+                .write()
+                .insert(account_addr, peer_hash);
+
+            // Log the critical identity bridge: AccountAddress ↔ NodeId ↔ IP
+            // This is the only place where all three identifiers are available
+            // simultaneously, enabling cross-referencing PoS logs with sniffer data.
+            if add_new_peer {
+                let bridge_ip = io
+                    .get_peer_addr(node_id)
+                    .map(|a| a.to_string())
+                    .unwrap_or_else(|| "unknown".to_string());
+                info!(
+                    "[POSSNIFFER] Identity bridge: account_addr={:?}, node_id={:#x}, ip={}",
+                    account_addr, node_id, bridge_ip
+                );
+            }
+
             if add_new_peer {
                 let event = NetworkEvent::PeerConnected;
                 if let Err(e) = self
@@ -609,6 +672,10 @@ impl NetworkProtocolHandler for HotStuffSynchronizationProtocol {
 
     fn on_peer_disconnected(&self, io: &dyn NetworkContext, peer: &NodeId) {
         let peer_hash = keccak(*peer);
+        info!(
+            "[POSSNIFFER] PoS peer disconnected: node_id={:#x}",
+            peer
+        );
         if let Some(peer_state) = self.peers.remove(&peer_hash) {
             if let Some(pos_public_key) = &peer_state.read().pos_public_key {
                 self.pos_peer_mapping.write().remove(

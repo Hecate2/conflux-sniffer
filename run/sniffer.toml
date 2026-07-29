@@ -29,8 +29,14 @@ max_handshakes = 128
 session_ip_limits = "0,0,0,0"
 subnet_quota = 0
 
-# Increase node table size for more peer discovery
-# node_table_timeout_s = 60
+# Passive peer discovery tuning (does NOT increase pressure on external nodes)
+# Keep discovered nodes in the table longer (default 300s → 600s) to reduce
+# re-discovery UDP traffic toward the network.
+node_table_timeout_s = 600
+# Promote peers from untrusted to trusted after 1 hour instead of 3 days
+# (default 259200s). This only affects our local node table management; it does
+# not send any additional traffic to external nodes.
+node_table_promotion_timeout_s = 3600
 
 # Heartbeat interval (keep connections alive)
 heartbeat_period_interval_ms = 30_000
