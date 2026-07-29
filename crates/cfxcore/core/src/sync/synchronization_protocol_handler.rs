@@ -387,9 +387,50 @@ pub struct SynchronizationProtocolHandler {
 
     // Sniffer mode fields
     #[ignore_malloc_size_of = "sniffer fields not measured"]
-    pub block_first_seen: Arc<RwLock<HashMap<H256, BlockFirstSeen>>>,
+    block_first_seen: Arc<RwLock<BlockFirstSeenTracker>>,
     #[ignore_malloc_size_of = "channel not measured"]
     pub sniffer_writer_tx: Option<std::sync::mpsc::Sender<BlockFirstSeen>>,
+}
+
+/// Bounded deduplication tracker for sniffer mode.
+///
+/// Uses a `HashSet` for O(1) lookup and a `VecDeque` for FIFO eviction.
+/// When the set exceeds `max_size`, the oldest entries are removed.
+/// This bounds memory usage for long-term running.
+const SNIFFER_MAX_SEEN_BLOCKS: usize = 50_000;
+
+struct BlockFirstSeenTracker {
+    seen: HashSet<H256>,
+    order: VecDeque<H256>,
+    max_size: usize,
+}
+
+impl BlockFirstSeenTracker {
+    fn new() -> Self {
+        Self {
+            seen: HashSet::with_capacity(SNIFFER_MAX_SEEN_BLOCKS),
+            order: VecDeque::with_capacity(SNIFFER_MAX_SEEN_BLOCKS),
+            max_size: SNIFFER_MAX_SEEN_BLOCKS,
+        }
+    }
+
+    /// Returns `true` if `hash` is newly inserted (first time seen).
+    /// Returns `false` if `hash` was already tracked.
+    fn check_and_insert(&mut self, hash: H256) -> bool {
+        if !self.seen.insert(hash) {
+            return false;
+        }
+        self.order.push_back(hash);
+        // Evict oldest entries if over capacity
+        while self.seen.len() > self.max_size {
+            if let Some(old) = self.order.pop_front() {
+                self.seen.remove(&old);
+            } else {
+                break;
+            }
+        }
+        true
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -443,6 +484,7 @@ pub struct ProtocolConfiguration {
 
     pub pos_started_as_voter: bool,
     pub sniffer_mode: bool,
+    pub sniffer_log_file: String,
 }
 
 impl SynchronizationProtocolHandler {
@@ -472,6 +514,7 @@ impl SynchronizationProtocolHandler {
         let state_sync = Arc::new(SnapshotChunkSync::new(state_sync_config));
 
         let sniffer_mode = protocol_config.sniffer_mode;
+        let sniffer_log_file = protocol_config.sniffer_log_file.clone();
         Self {
             protocol_version: SYNCHRONIZATION_PROTOCOL_VERSION,
             protocol_config,
@@ -495,9 +538,9 @@ impl SynchronizationProtocolHandler {
             state_sync,
             synced_epoch_id: Default::default(),
             light_provider,
-            block_first_seen: Arc::new(RwLock::new(HashMap::new())),
+            block_first_seen: Arc::new(RwLock::new(BlockFirstSeenTracker::new())),
             sniffer_writer_tx: if sniffer_mode {
-                Some(Self::start_sniffer_writer("sniffer_records.jsonl"))
+                Some(Self::start_sniffer_writer(&sniffer_log_file))
             } else {
                 None
             },
@@ -519,13 +562,13 @@ impl SynchronizationProtocolHandler {
                 let json = serde_json::json!({
                     "block_hash": format!("{:?}", record.block_hash),
                     "first_peer_ip": record.first_peer_ip.map(|ip| ip.to_string()),
-                    "first_peer_node_id": format!("{}", record.first_peer_node_id),
-                    "first_seen_at": record.first_seen_at
+                    "first_peer_node_id": format!("{:?}", record.first_peer_node_id),
+                    "first_seen_at_ms": record.first_seen_at
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
-                        .as_secs(),
+                        .as_millis() as u64,
                 });
-                let _ = writeln!(file, "{}", json.to_string());
+                let _ = writeln!(file, "{}", json);
             }
         });
         tx
@@ -535,19 +578,17 @@ impl SynchronizationProtocolHandler {
         &self, hash: H256, peer_addr: Option<std::net::SocketAddr>,
         node_id: NodeId,
     ) {
-        let mut map = self.block_first_seen.write();
-        if !map.contains_key(&hash) {
+        let is_new = self.block_first_seen.write().check_and_insert(hash);
+        if is_new {
             let entry = BlockFirstSeen {
                 block_hash: hash,
                 first_peer_ip: peer_addr.map(|a| a.ip()),
                 first_seen_at: SystemTime::now(),
                 first_peer_node_id: node_id,
             };
-            map.insert(hash, entry.clone());
-            drop(map);
 
             info!(
-                "[SNIFFER] NEW_BLOCK_HASH first seen: hash={:?}, ip={:?}, node_id={}",
+                "[SNIFFER] NEW_BLOCK_HASH first seen: hash={:?}, ip={:?}, node_id={:?}",
                 hash, peer_addr.map(|a| a.ip()), node_id
             );
 

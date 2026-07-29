@@ -977,6 +977,7 @@ impl Configuration {
             check_status_genesis: self.raw_conf.check_status_genesis,
             pos_started_as_voter: self.raw_conf.pos_started_as_voter,
             sniffer_mode: self.raw_conf.sniffer_mode,
+            sniffer_log_file: self.raw_conf.sniffer_log_file.clone(),
         }
     }
 

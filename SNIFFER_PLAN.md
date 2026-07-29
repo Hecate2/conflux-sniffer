@@ -153,18 +153,12 @@ impl Handleable for NewBlockHashes {
 ```rust
 impl Handleable for NewBlock {
     fn handle(self, ctx: &Context) -> Result<(), Error> {
-        if ctx.manager.sniffer_mode {
+        if ctx.manager.protocol_config.sniffer_mode {
             let hash = self.block.block_header.hash();
             ctx.manager.record_block_hash_first_seen(
                 hash,
                 ctx.peer_addr,
                 ctx.node_id,
-            );
-            // 额外记录完整区块头信息，用于后续分析异常区块
-            ctx.manager.record_block_header(
-                hash,
-                &self.block.block_header,
-                ctx.peer_addr,
             );
             return Ok(());
         }
@@ -398,14 +392,13 @@ fn start_sniffer_writer(log_path: &str) -> std::sync::mpsc::Sender<BlockFirstSee
             let json = serde_json::json!({
                 "block_hash": format!("{:?}", record.block_hash),
                 "first_peer_ip": record.first_peer_ip.map(|ip| ip.to_string()),
-                "first_peer_node_id": format!("{}", record.first_peer_node_id),
-                "first_seen_at": record.first_seen_at
+                "first_peer_node_id": format!("{:?}", record.first_peer_node_id),
+                "first_seen_at_ms": record.first_seen_at
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
-                    .as_secs(),
-                "timestamp": chrono::Utc::now().to_rfc3339(),
+                    .as_millis() as u64,
             });
-            let _ = writeln!(file, "{}", json.to_string());
+            let _ = writeln!(file, "{}", json);
         }
     });
     tx
@@ -415,14 +408,13 @@ fn start_sniffer_writer(log_path: &str) -> std::sync::mpsc::Sender<BlockFirstSee
 pub fn record_block_hash_first_seen(
     &self, hash: H256, peer_addr: Option<SocketAddr>, node_id: NodeId,
 ) {
-    let mut map = self.block_first_seen.write();
-    if !map.contains_key(&hash) {
+    let is_new = self.block_first_seen.write().check_and_insert(hash);
+    if is_new {
         let entry = BlockFirstSeen { /* ... */ };
-        map.insert(hash, entry.clone());
 
         info!(
-            "[SNIFFER] NEW_BLOCK_HASH first seen: hash={:?}, ip={:?}, node_id={}",
-            hash, entry.first_peer_ip, node_id
+            "[SNIFFER] NEW_BLOCK_HASH first seen: hash={:?}, ip={:?}, node_id={:?}",
+            hash, peer_addr.map(|a| a.ip()), node_id
         );
 
         // 非阻塞发送到写入线程
@@ -589,7 +581,7 @@ pub fn sniffer_log_file(&self) -> &str { &self.raw_conf.sniffer_log_file }
 pub struct SynchronizationProtocolHandler {
     // ... 现有字段保持不变 ...
     pub sniffer_mode: bool,
-    pub block_first_seen: Arc<RwLock<HashMap<H256, BlockFirstSeen>>>,
+    block_first_seen: Arc<RwLock<BlockFirstSeenTracker>>,
     pub sniffer_writer_tx: Option<std::sync::mpsc::Sender<BlockFirstSeen>>,
 }
 ```
@@ -597,25 +589,45 @@ pub struct SynchronizationProtocolHandler {
 添加数据结构：
 
 ```rust
+const SNIFFER_MAX_SEEN_BLOCKS: usize = 50_000;
+
+struct BlockFirstSeenTracker {
+    seen: HashSet<H256>,
+    order: VecDeque<H256>,
+    max_size: usize,
+}
+
+impl BlockFirstSeenTracker {
+    fn new() -> Self {
+        Self {
+            seen: HashSet::with_capacity(SNIFFER_MAX_SEEN_BLOCKS),
+            order: VecDeque::with_capacity(SNIFFER_MAX_SEEN_BLOCKS),
+            max_size: SNIFFER_MAX_SEEN_BLOCKS,
+        }
+    }
+
+    fn check_and_insert(&mut self, hash: H256) -> bool {
+        if !self.seen.insert(hash) {
+            return false;
+        }
+        self.order.push_back(hash);
+        while self.seen.len() > self.max_size {
+            if let Some(old) = self.order.pop_front() {
+                self.seen.remove(&old);
+            } else {
+                break;
+            }
+        }
+        true
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct BlockFirstSeen {
     pub block_hash: H256,
     pub first_peer_ip: Option<IpAddr>,
-    pub first_seen_at: Instant,
+    pub first_seen_at: SystemTime,
     pub first_peer_node_id: NodeId,
-}
-
-#[derive(Debug, Clone)]
-pub struct BlockHeaderRecord {
-    pub block_hash: H256,
-    pub height: u64,
-    pub difficulty: U256,
-    pub nonce: u64,
-    pub timestamp: u64,
-    pub author: Address,
-    pub pos_public_key: Option<String>,
-    pub first_peer_ip: Option<IpAddr>,
-    pub received_at: u64,
 }
 ```
 
@@ -625,89 +637,55 @@ pub struct BlockHeaderRecord {
 
 ```rust
 impl SynchronizationProtocolHandler {
-    /// 初始化窃听模式：创建写入线程
-    pub fn init_sniffer_mode(&self, log_file: &str) {
+    /// 启动写入线程（在 new() 中根据 sniffer_mode 配置调用）
+    fn start_sniffer_writer(
+        log_path: &str,
+    ) -> std::sync::mpsc::Sender<BlockFirstSeen> {
         let (tx, rx) = std::sync::mpsc::channel::<BlockFirstSeen>();
-        let path = log_file.to_string();
-
+        let path = log_path.to_string();
         std::thread::spawn(move || {
             let mut file = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(&path)
                 .expect("Failed to open sniffer log file");
-
             for record in rx {
                 let json = serde_json::json!({
                     "block_hash": format!("{:?}", record.block_hash),
                     "first_peer_ip": record.first_peer_ip.map(|ip| ip.to_string()),
-                    "first_peer_node_id": format!("{}", record.first_peer_node_id),
-                    "first_seen_at": record.first_seen_at
+                    "first_peer_node_id": format!("{:?}", record.first_peer_node_id),
+                    "first_seen_at_ms": record.first_seen_at
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
-                        .as_secs(),
-                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                        .as_millis() as u64,
                 });
-                let _ = writeln!(file, "{}", json.to_string());
+                let _ = writeln!(file, "{}", json);
             }
         });
-
-        // 注意：由于 sniffer_writer_tx 不是 mut，需要在构造时设置
-        // 实际实现中应在 new() 方法中根据配置决定是否初始化
+        tx
     }
 
     /// 记录区块哈希的首达 IP（非阻塞）
     pub fn record_block_hash_first_seen(
         &self, hash: H256, peer_addr: Option<SocketAddr>, node_id: NodeId,
     ) {
-        let mut map = self.block_first_seen.write();
-        if !map.contains_key(&hash) {
+        let is_new = self.block_first_seen.write().check_and_insert(hash);
+        if is_new {
             let entry = BlockFirstSeen {
                 block_hash: hash,
                 first_peer_ip: peer_addr.map(|a| a.ip()),
-                first_seen_at: Instant::now(),
+                first_seen_at: SystemTime::now(),
                 first_peer_node_id: node_id,
             };
-            map.insert(hash, entry.clone());
 
             info!(
-                "[SNIFFER] NEW_BLOCK_HASH first seen: hash={:?}, ip={:?}, node_id={}",
-                hash, entry.first_peer_ip, node_id
+                "[SNIFFER] NEW_BLOCK_HASH first seen: hash={:?}, ip={:?}, node_id={:?}",
+                hash, peer_addr.map(|a| a.ip()), node_id
             );
 
             if let Some(tx) = &self.sniffer_writer_tx {
                 let _ = tx.send(entry);
             }
-        }
-    }
-
-    /// 记录完整区块头信息（用于异常区块分析）
-    pub fn record_block_header(
-        &self, hash: H256, header: &BlockHeader,
-        peer_addr: Option<SocketAddr>,
-    ) {
-        let record = BlockHeaderRecord {
-            block_hash: hash,
-            height: header.height(),
-            difficulty: header.difficulty().clone(),
-            nonce: header.nonce(),
-            timestamp: header.timestamp(),
-            author: header.author().clone(),
-            pos_public_key: header.pos_public_key()
-                .map(|k| format!("{:?}", k)),
-            first_peer_ip: peer_addr.map(|a| a.ip()),
-            received_at: chrono::Utc::now().timestamp() as u64,
-        };
-
-        info!(
-            "[SNIFFER] BLOCK_HEADER: hash={:?}, height={}, difficulty={}, nonce={}, pos_key={:?}, ip={:?}",
-            record.block_hash, record.height, record.difficulty,
-            record.nonce, record.pos_public_key, record.first_peer_ip
-        );
-
-        // 区块头记录也写入单独文件
-        if let Some(tx) = &self.sniffer_writer_tx {
-            // 可以复用同一个 channel，或使用单独的 channel
         }
     }
 }
@@ -906,7 +884,7 @@ log_file = "sniffer.log"
 每行一条 JSON 记录：
 
 ```json
-{"block_hash":"0xabc...def","first_peer_ip":"39.97.180.246","first_peer_node_id":"abc123...","first_seen_at":1753708801,"timestamp":"2026-07-28T12:00:01Z"}
+{"block_hash":"0xabc...def","first_peer_ip":"39.97.180.246","first_peer_node_id":"0x04ce1234...1d60","first_seen_at_ms":1753708801123}
 ```
 
 ### 6.3 异常区块特征记录
@@ -1016,7 +994,7 @@ cat sniffer_records.jsonl
 cat sniffer_records.jsonl | jq -r '.first_peer_ip' | sort | uniq -c | sort -rn
 
 # 按时间范围查询
-cat sniffer_records.jsonl | jq 'select(.first_seen_at >= 1753708800 and .first_seen_at < 1753708860)'
+cat sniffer_records.jsonl | jq 'select(.first_seen_at_ms >= 1753708800000 and .first_seen_at_ms < 1753708860000)'
 
 # 查找特定区块哈希
 cat sniffer_records.jsonl | jq 'select(.block_hash == "0xabc...def")'
@@ -1226,40 +1204,13 @@ const SYNCHRONIZATION_PROTOCOL_OLD_VERSIONS_TO_SUPPORT: u8 = 2;
 
 ## 15. 内存管理补充
 
-### 15.1 block_first_seen 内存增长
+### 15.1 block_first_seen 有界去重
 
-`block_first_seen: Arc<RwLock<HashMap<H256, BlockFirstSeen>>>` 会随时间持续增长。主网每天产生约 300,000 个区块，长期运行会消耗大量内存。
+`block_first_seen` 使用 `BlockFirstSeenTracker` 进行有界去重，内部维护 `HashSet<H256>` 用于 O(1) 查重和 `VecDeque<H256>` 用于 FIFO 淘汰。当已跟踪的区块哈希数量超过 `SNIFFER_MAX_SEEN_BLOCKS`（默认 50,000）时，最旧的条目会被自动淘汰。
 
-**解决方案**：
+主网每天产生约 300,000 个区块，50,000 条容量约覆盖 4 小时。由于 JSONL 文件已持久化所有首次见到的区块信息，内存中的去重集合仅用于避免对同一区块的重复写入。旧条目被淘汰后，如果同一区块哈希再次出现（极小概率），会重复写入一条记录，但不影响数据分析的正确性。
 
-在 `record_block_hash_first_seen` 中添加容量限制，当 HashMap 超过阈值（如 100,000 条）时，删除最旧的记录：
-
-```rust
-pub fn record_block_hash_first_seen(
-    &self, hash: H256, peer_addr: Option<SocketAddr>, node_id: NodeId,
-) {
-    let mut map = self.block_first_seen.write();
-    if map.contains_key(&hash) {
-        return;
-    }
-
-    // 容量限制：超过阈值时清理最旧的记录
-    const MAX_ENTRIES: usize = 100_000;
-    if map.len() >= MAX_ENTRIES {
-        // 找到 first_seen_at 最早的条目并删除
-        if let Some((&oldest_hash, _)) = map
-            .iter()
-            .min_by_key(|(_, v)| v.first_seen_at)
-        {
-            map.remove(&oldest_hash);
-        }
-    }
-
-    // 插入新记录...
-}
-```
-
-注意：此清理逻辑会扫描整个 HashMap，在 100,000 条记录时性能可接受（O(n) 但 n 有上限）。如需更高性能，可改用 `BTreeMap<Instant, H256>` 作为辅助索引。
+该设计确保长期运行时内存占用恒定（约 1.6 MB），不会随运行时间增长。
 
 ---
 

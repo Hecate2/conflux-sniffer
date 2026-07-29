@@ -110,8 +110,8 @@ kill $SNIFFER_PID
 {
   "block_hash": "0xa4a094a69acb6372fd0c8d33e30db51ccdf77b5a451f01496db863bf87feb003",
   "first_peer_ip": "106.14.64.36",
-  "first_peer_node_id": "0x04ce…1d60",
-  "first_seen_at": 1785248027
+  "first_peer_node_id": "0x04ce1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1d60",
+  "first_seen_at_ms": 1785248027123
 }
 ```
 
@@ -119,10 +119,10 @@ kill $SNIFFER_PID
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
-| `block_hash` | string | 区块哈希，十六进制 0x 前缀格式 |
+| `block_hash` | string | 区块哈希，十六进制 0x 前缀格式（66 字符） |
 | `first_peer_ip` | string 或 null | 最先发送该区块哈希的 peer 的 IP 地址。如果 IP 不可获取则为 null |
-| `first_peer_node_id` | string | 最先发送该区块哈希的 peer 的 NodeId（Conflux P2P 节点标识符） |
-| `first_seen_at` | integer | 本节点首次收到该区块哈希的 Unix 时间戳（秒级） |
+| `first_peer_node_id` | string | 最先发送该区块哈希的 peer 的完整 NodeId（H512，130 字符十六进制），通过 Debug 格式输出完整值 |
+| `first_seen_at_ms` | integer | 本节点首次收到该区块哈希的 Unix 时间戳（毫秒级） |
 
 写入机制采用异步线程：网络 IO 线程通过 `std::sync::mpsc::channel` 将记录发送到专用写入线程，由写入线程执行文件 I/O。这确保高频消息场景下不会阻塞网络处理。
 
@@ -208,7 +208,7 @@ cat sniffer_records.jsonl | python3 -c "
 import json, sys
 for line in sys.stdin:
     r = json.loads(line)
-    if r['first_seen_at'] >= 1785248027 and r['first_seen_at'] < 1785248087:
+    if r['first_seen_at_ms'] >= 1785248027000 and r['first_seen_at_ms'] < 1785248087000:
         print(json.dumps(r))
 "
 
@@ -367,12 +367,12 @@ Conflux 使用心跳机制检测连接活跃性，默认超时时间 180 秒。�
 | `crates/network/src/lib.rs` | 在 `NetworkContext` trait 中添加 `get_peer_addr()` 方法声明 |
 | `crates/network/src/service.rs` | 实现 `get_peer_addr()`，通过 `sessions.get_by_id()` 获取 peer 的 `SocketAddr` |
 | `crates/cfxcore/core/src/sync/message/handleable.rs` | 在 `Context` 结构体中添加 `peer_addr: Option<SocketAddr>` 字段 |
-| `crates/cfxcore/core/src/sync/synchronization_protocol_handler.rs` | 核心修改：添加 `BlockFirstSeen` 结构体、`block_first_seen` 字段、`sniffer_writer_tx` 字段、`start_sniffer_writer()` 异步写入线程、`record_block_hash_first_seen()` 记录方法；在 `catch_up_mode()`、`start_sync()`、`broadcast_heartbeat()`、`update_sync_phase()`、`on_work_dispatch()`、`on_timeout()` 中添加 sniffer_mode 守卫；在 `dispatch_message()` 中填充 `peer_addr` |
+| `crates/cfxcore/core/src/sync/synchronization_protocol_handler.rs` | 核心修改：添加 `BlockFirstSeenTracker`（有界 FIFO 去重，容量 50,000）、`BlockFirstSeen` 结构体、`block_first_seen` 字段、`sniffer_writer_tx` 字段、`start_sniffer_writer()` 异步写入线程（使用配置项 `sniffer_log_file`）、`record_block_hash_first_seen()` 记录方法；在 `catch_up_mode()`、`start_sync()`、`broadcast_heartbeat()`、`update_sync_phase()`、`on_work_dispatch()`、`on_timeout()` 中添加 sniffer_mode 守卫；在 `dispatch_message()` 中填充 `peer_addr` |
 | `crates/cfxcore/core/src/sync/message/new_block_hashes.rs` | 在 `handle()` 开头添加 sniffer_mode 检查，记录首达 IP 后返回 |
 | `crates/cfxcore/core/src/sync/message/new_block.rs` | 在 `handle()` 开头添加 sniffer_mode 检查，记录首达 IP 后返回 |
 | `crates/cfxcore/core/src/sync/message/transactions.rs` | 在 `Transactions::handle()` 和 `TransactionDigests::handle()` 开头添加 sniffer_mode 检查直接返回 |
 | `crates/cfxcore/core/src/sync/state/snapshot_chunk_sync.rs` | 在 `Context` 构造点补充 `peer_addr: None` 字段 |
-| `crates/config/src/configuration.rs` | 在 `build_config!` 宏中添加 `sniffer_mode` 和 `sniffer_log_file` 配置项；在 `ProtocolConfiguration` 中添加 `sniffer_mode` 字段 |
+| `crates/config/src/configuration.rs` | 在 `build_config!` 宏中添加 `sniffer_mode` 和 `sniffer_log_file` 配置项；在 `ProtocolConfiguration` 中添加 `sniffer_mode` 和 `sniffer_log_file` 字段 |
 | `run/sniffer.toml` | 新增窃听节点配置文件 |
 | `.gitignore` | 添加 `pos_key`、`sniffer_data/`、`sniffer_records.jsonl`、`pos_config/` 的忽略规则 |
 
@@ -448,15 +448,16 @@ Conflux 使用心跳机制检测连接活跃性，默认超时时间 180 秒。�
 
 ### 9.1 配置项访问路径
 
-sniffer_mode 标志存储在 `ProtocolConfiguration` 中，通过 `self.protocol_config.sniffer_mode` 访问。在 `SynchronizationProtocolHandler::new()` 中，`sniffer_mode` 的值在 `protocol_config` 被 move 之前提前提取，用于决定是否初始化写入线程：
+`sniffer_mode` 和 `sniffer_log_file` 存储在 `ProtocolConfiguration` 中，通过 `self.protocol_config.sniffer_mode` 访问。在 `SynchronizationProtocolHandler::new()` 中，这两个值在 `protocol_config` 被 move 之前提前提取，用于决定是否初始化写入线程及输出文件路径：
 
 ```rust
 let sniffer_mode = protocol_config.sniffer_mode;
+let sniffer_log_file = protocol_config.sniffer_log_file.clone();
 Self {
     protocol_config,
     // ...
     sniffer_writer_tx: if sniffer_mode {
-        Some(Self::start_sniffer_writer("sniffer_records.jsonl"))
+        Some(Self::start_sniffer_writer(&sniffer_log_file))
     } else {
         None
     },
@@ -474,11 +475,11 @@ pub struct BlockFirstSeen {
 }
 ```
 
-使用 `SystemTime` 而非 `Instant`，因为需要将时间戳转换为 Unix epoch 秒数写入 JSONL 文件。`Instant` 只能用于测量时间间隔，不能转换为绝对时间。
+使用 `SystemTime` 而非 `Instant`，因为需要将时间戳转换为 Unix epoch 毫秒数写入 JSONL 文件。`Instant` 只能用于测量时间间隔，不能转换为绝对时间。
 
 ### 9.3 异步写入线程
 
-`start_sniffer_writer()` 创建一个 `std::sync::mpsc::channel` 和一个专用写入线程。写入线程以 append 模式打开 JSONL 文件，循环从 channel 接收 `BlockFirstSeen` 记录并写入文件。网络 IO 线程通过 `tx.send(entry)` 非阻塞地将记录发送到写入线程。
+`start_sniffer_writer()` 创建一个 `std::sync::mpsc::channel` 和一个专用写入线程。写入线程以 append 模式打开 JSONL 文件（文件路径由配置项 `sniffer_log_file` 指定，默认 `sniffer_records.jsonl`），循环从 channel 接收 `BlockFirstSeen` 记录并写入文件。网络 IO 线程通过 `tx.send(entry)` 非阻塞地将记录发送到写入线程。文件以 append 模式打开，多次运行不会覆盖之前的记录。
 
 ### 9.4 主网 Genesis Block
 
@@ -490,7 +491,11 @@ pub struct BlockFirstSeen {
 
 ### 9.6 内存管理
 
-`block_first_seen: Arc<RwLock<HashMap<H256, BlockFirstSeen>>>` 会随时间持续增长。主网每天产生约 300,000 个区块，长期运行会消耗大量内存。当前实现尚未添加容量限制。如果需要长期运行，建议定期重启节点，或在 `record_block_hash_first_seen()` 中添加 LRU 淘汰逻辑。
+`block_first_seen` 使用 `BlockFirstSeenTracker` 进行有界去重，而非无限增长的 `HashMap`。该数据结构内部维护一个 `HashSet<H256>` 用于 O(1) 查重和一个 `VecDeque<H256>` 用于 FIFO 淘汰。当已跟踪的区块哈希数量超过 `SNIFFER_MAX_SEEN_BLOCKS`（默认 50,000）时，最旧的条目会被自动淘汰。
+
+主网每天产生约 300,000 个区块，50,000 条容量约覆盖 4 小时的区块数据。由于 JSONL 文件已经持久化记录了所有首次见到的区块信息，内存中的去重集合仅用于避免对同一区块的重复写入。当旧条目被淘汰后，如果同一区块哈希再次出现（极小概率），会重复写入一条记录，但这不影响数据分析的正确性。
+
+该设计确保长期运行时内存占用恒定（约 50,000 × 32 字节 ≈ 1.6 MB 的 H256 哈希集合），不会随运行时间增长。
 
 ---
 
@@ -499,7 +504,4 @@ pub struct BlockFirstSeen {
 | 项目 | 当前状态 | 改进方向 |
 |------|----------|----------|
 | 区块头记录 | 仅记录区块哈希和来源 IP，未记录 difficulty/nonce/pos_public_key 等区块头字段 | 在 `NewBlock::handle()` 中提取并记录完整区块头信息，便于直接识别异常区块 |
-| 内存管理 | `block_first_seen` HashMap 无限增长 | 添加容量限制（如 100,000 条），超过时淘汰最旧记录 |
-| 时间戳精度 | `first_seen_at` 为秒级 | 改为毫秒级以支持更精细的传播延迟分析 |
 | 多消息类型记录 | `NewBlockHashes` 和 `NewBlock` 共用同一个记录函数，无法区分来源消息类型 | 在 `BlockFirstSeen` 中添加 `source_msg_type` 字段 |
-| 配置灵活性 | `sniffer_log_file` 配置项已定义但实际硬编码为 `"sniffer_records.jsonl"` | 在 `start_sniffer_writer()` 中使用配置值 |
