@@ -1731,7 +1731,17 @@ impl SynchronizationProtocolHandler {
             .database_gc(self.graph.consensus.best_epoch_number())
     }
 
-    fn log_statistics(&self) { self.graph.log_statistics(); }
+    fn log_statistics(&self) {
+        if self.protocol_config.sniffer_mode {
+            let connected = self.syn.peers.read().len();
+            let handshaking = self.syn.handshaking_peers.read().len();
+            info!(
+                "[SNIFFER] Peer stats: {} connected, {} handshaking",
+                connected, handshaking
+            );
+        }
+        self.graph.log_statistics();
+    }
 
     fn update_total_weight_delta_heartbeat(&self) {
         self.graph.update_total_weight_delta_heartbeat();
